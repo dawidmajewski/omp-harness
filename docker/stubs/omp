@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Test stub for omp: records the scope it was launched with, and copies every
+# --config / --append-system-prompt file into $HOME/.omph-stub.files (omph's are temp files).
+# OMPH_TEST_NESTED_DIR: instead of recording, re-run omph from that dir, like a
+# shell spawned inside an omp session would.
+if [ -n "${OMPH_TEST_NESTED_DIR-}" ]; then
+  dir=$OMPH_TEST_NESTED_DIR
+  unset OMPH_TEST_NESTED_DIR
+  cd "$dir" && exec omph -p hi
+fi
+printf 'OMPH_PROFILES=%s OMPH_TEST_SECRET=%s OMP_PROFILE=%s ARGS=%s\n' \
+  "${OMPH_PROFILES-}" "${OMPH_TEST_SECRET-}" "${OMP_PROFILE-}" "$*" >> "${OMPH_TEST_LOG:-$HOME/.omph-stub.log}"
+: > "$HOME/.omph-stub.files"
+while [ $# -gt 0 ]; do
+  case $1 in
+    --config | --append-system-prompt) printf '== %s\n' "$1" >> "$HOME/.omph-stub.files"; cat "$2" >> "$HOME/.omph-stub.files"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+echo "stub-omp ok"

@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+# omph — OMP Harness. Runs omp on the global OMP setup (shared logins, sessions,
+# models) with the profiles named by the nearest trusted .omph marker layered on
+# top: their MCP servers, skills, instructions and secrets. See docs/architecture.md.
+set -euo pipefail
+
+OMPH_HOME="$HOME/.config/omph"
+OMPH_PROFILES_DIR="$OMPH_HOME/profiles"
+OMPH_TRUST="$OMPH_HOME/trusted"
+OMP_AGENT="$HOME/.omp/agent"
+MCP_POOL="$OMP_AGENT/mcp.json"
+# Settings omph generates per launch; arrays replace across config layers, so nothing else may set them.
+OWNED_KEYS_RE='^[[:space:]]*(disabledExtensions|customDirectories):'
+
+die() { local code=$1; shift; printf 'omph: %s\n' "$*" >&2; exit "$code"; }
+warn() { printf 'omph: %s\n' "$*" >&2; }
+trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; s=${s%"${s##*[![:space:]]}"}; printf '%s' "$s"; }
+valid_name() { [[ $1 =~ ^[A-Za-z0-9_-]+$ ]]; }
+file_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+
+# Print non-blank, non-comment lines of a list file, trimmed.
+list_lines() {
+  local line
+  [ -f "$1" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(trim "$line")
+    case $line in '' | '#'*) continue ;; esac
+    printf '%s\n' "$line"
+  done <"$1"
+}
+
+# Print the directory holding the nearest .omph owned by the current user, walking
+# from $PWD up to $HOME (inclusive) or /, whichever comes first. Prints nothing if none.
+# A symlinked marker is refused: it would borrow another marker's content and trust.
+resolve_marker() {
+  local dir=$PWD
+  while [ "$dir" != / ]; do
+    [ ! -L "$dir/.omph" ] || die 1 "$dir/.omph is a symlink; refusing"
+    if [ -f "$dir/.omph" ] && [ -r "$dir/.omph" ] && [ -O "$dir/.omph" ]; then printf '%s\n' "$dir"; return 0; fi
+    [ "$dir" = "$HOME" ] && return 0
+    dir=$(dirname "$dir")
+  done
+}
+
+# Strict `profiles = a, b, c` parse; the marker is data and is never sourced.
+# Sets MARKER_PROFILES (space-separated, validated, de-duplicated, in order).
+parse_marker() {
+  local file=$1 line key val p names
+  MARKER_PROFILES=''
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(trim "$line")
+    case $line in '' | '#'*) continue ;; esac
+    [[ $line =~ ^[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[[:space:]]*.+$ ]] || die 1 "invalid line in $file: $line"
+    key=$(trim "${line%%=*}")
+    val=$(trim "${line#*=}")
+    [ "$key" = profiles ] || die 1 "unknown key '$key' in $file (expected: profiles)"
+    IFS=, read -r -a names <<<"$val"
+    for p in "${names[@]}"; do
+      p=$(trim "$p")
+      valid_name "$p" || die 1 "invalid profile name '$p' in $file"
+      case " $MARKER_PROFILES " in *" $p "*) ;; *) MARKER_PROFILES="${MARKER_PROFILES:+$MARKER_PROFILES }$p" ;; esac
+    done
+  done <"$file"
+  [ -n "$MARKER_PROFILES" ] || die 1 "$file has no 'profiles'"
+}
+
+# A marker is trusted when its exact content (sha256) at its realpath was approved
+# by `omph :use` or `omph :trust`. Cloned or edited markers need re-approval.
+# Whole-line comparison: a path containing a newline can never match.
+is_trusted() {
+  local f want line
+  [ ! -L "$1" ] && [ -f "$OMPH_TRUST" ] || return 1
+  f=$(realpath "$1")
+  want="$(sha256 "$f") $f"
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ "$line" != "$want" ] || return 0
+  done <"$OMPH_TRUST"
+  return 1
+}
+
+trust_marker() {
+  local f line tmp
+  [ ! -L "$1" ] || die 1 "$1 is a symlink; refusing"
+  f=$(realpath "$1")
+  case $f in *$'\n'*) die 1 "refusing to trust a path containing a newline" ;; esac
+  mkdir -p "$OMPH_HOME"
+  tmp=$(mktemp "$OMPH_HOME/trusted.XXXXXX")
+  if [ -f "$OMPH_TRUST" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ "${line#* }" = "$f" ] || printf '%s\n' "$line"
+    done <"$OMPH_TRUST" >"$tmp"
+  fi
+  printf '%s %s\n' "$(sha256 "$f")" "$f" >>"$tmp"
+  mv -f "$tmp" "$OMPH_TRUST"
+}
+
+# Drop the scope of an outer omph session (shells spawned by omp inherit it), so a
+# nested run starts clean. Inherited PATH/HOME and omph's own globals are kept:
+# unsetting them would break the launch. Positional params, not a local, so no
+# tracked name can shadow the loop variable. OMP_PROFILE is cleared because omph
+# always runs the global OMP base.
+clear_inherited_scope() {
+  set -f
+  # shellcheck disable=SC2086
+  set -- ${OMPH_ENV_KEYS-}
+  set +f
+  while [ $# -gt 0 ]; do
+    case $1 in
+      PATH | HOME | OMPH_HOME | OMPH_PROFILES_DIR | OMPH_TRUST | OMP_AGENT | MCP_POOL | OWNED_KEYS_RE) ;;
+      *) if [[ $1 =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then unset "$1"; fi ;;
+    esac
+    shift
+  done
+  unset OMPH_ENV_KEYS OMPH_PROFILES OMP_PROFILE
+}
+
+# Print the variable names a KEY=VALUE env file assigns (optional `export ` prefix).
+env_keys() {
+  local line keys=''
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ $line =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)= ]]; then keys="$keys ${BASH_REMATCH[2]}"; fi
+  done <"$1"
+  printf '%s' "${keys# }"
+}
+
+# Print MCP server names in the global pool (~/.omp/agent/mcp.json).
+pool_servers() {
+  [ -f "$MCP_POOL" ] || return 0
+  command -v jq >/dev/null || die 1 "jq is required to read $MCP_POOL"
+  jq -r '.mcpServers // {} | keys[]' "$MCP_POOL"
+}
+
+# Resolve which profiles apply here into PROFILES (space-separated); empty = plain omp.
+# Marker found -> its profiles (must be trusted). No marker -> `base` if it exists.
+resolve_profiles() {
+  local md
+  PROFILES='' PROFILES_SOURCE=''
+  md=$(resolve_marker)
+  if [ -n "$md" ]; then
+    parse_marker "$md/.omph"
+    PROFILES=$MARKER_PROFILES PROFILES_SOURCE="$md/.omph"
+  elif [ -d "$OMPH_PROFILES_DIR/base" ]; then
+    PROFILES=base PROFILES_SOURCE='(no marker: base)'
+  fi
+}
+
+# Build _omph_launch (extra omp args) and _omph_envs (env files, in order) for
+# PROFILES. Secrets are sourced later by source_envs, so they cannot clobber state here.
+activate_profiles() {
+  local p dir s pool selected='' disabled='' skills='' keys='' mode tmp
+  _omph_launch=() _omph_envs=()
+  for p in $PROFILES; do
+    [ -d "$OMPH_PROFILES_DIR/$p" ] || die 1 "profile '$p' not found (run: omph :init $p)"
+  done
+  pool=$(pool_servers)
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    [[ $s =~ ^[A-Za-z0-9_.:\ -]+$ ]] || die 1 "unsupported MCP server name in $MCP_POOL: $s"
+  done <<<"$pool"
+
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/omph.XXXXXX")
+  for p in $PROFILES; do
+    dir="$OMPH_PROFILES_DIR/$p"
+    while IFS= read -r s; do
+      [ -n "$s" ] || continue
+      grep -Fxq -- "$s" <<<"$pool" || die 1 "profile '$p' wants MCP server '$s', which is not in $MCP_POOL"
+      selected="$selected$s"$'\n'
+    done <<<"$(list_lines "$dir/mcp")"
+    [ -d "$dir/skills" ] && skills="$skills$dir/skills"$'\n'
+    if [ -s "$dir/instructions.md" ]; then
+      { printf '\n## Profile: %s\n\n' "$p"; cat "$dir/instructions.md"; } >>"$tmp/instructions.md"
+    fi
+    if [ -f "$dir/config.yml" ]; then
+      ! grep -Eq "$OWNED_KEYS_RE" "$dir/config.yml" || die 1 "$dir/config.yml sets disabledExtensions/customDirectories, which omph owns; use the profile's mcp file and skills/ dir"
+      _omph_launch+=(--config "$dir/config.yml")
+    fi
+    if [ -f "$dir/env" ]; then
+      mode=$(file_mode "$dir/env")
+      [ "$mode" = 600 ] || warn "$dir/env has mode $mode; expected 600"
+      _omph_envs+=("$dir/env")
+      keys="$keys $(env_keys "$dir/env")"
+    fi
+  done
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    grep -Fxq -- "$s" <<<"$selected" || disabled="$disabled$s"$'\n'
+  done <<<"$pool"
+
+  if [ -f "$OMP_AGENT/config.yml" ] && grep -Eq "$OWNED_KEYS_RE" "$OMP_AGENT/config.yml"; then
+    warn "$OMP_AGENT/config.yml sets disabledExtensions/customDirectories; omph replaces them for this run"
+  fi
+  {
+    printf '# generated by omph for profiles: %s\n' "$PROFILES"
+    if [ -n "$disabled" ]; then
+      echo 'disabledExtensions:'
+      printf '%s' "$disabled" | while IFS= read -r s; do printf '  - "mcp:%s"\n' "$s"; done
+    else
+      echo 'disabledExtensions: []'
+    fi
+    echo 'skills:'
+    if [ -n "$skills" ]; then
+      echo '  customDirectories:'
+      printf '%s' "$skills" | while IFS= read -r s; do printf '    - "%s"\n' "$s"; done
+    else
+      echo '  customDirectories: []'
+    fi
+  } >"$tmp/overlay.yml"
+  _omph_launch+=(--config "$tmp/overlay.yml")
+  if [ -f "$tmp/instructions.md" ]; then _omph_launch+=(--append-system-prompt "$tmp/instructions.md"); fi
+
+  _omph_keys=$(trim "$keys")
+}
+
+# launch_omp <profiles-csv> <env-keys> <n> <env file>... <omp arg>...
+# Sources the n env files (auto-export), then execs omp. Everything needed after
+# sourcing travels in positional params, so no secret's name can clobber it.
+launch_omp() {
+  set -a
+  while [ "$3" -gt 0 ]; do
+    # shellcheck disable=SC1090
+    . "$4"
+    set -- "$1" "$2" "$(($3 - 1))" "${@:5}"
+  done
+  set +a
+  export OMPH_PROFILES="$1" OMPH_ENV_KEYS="$2"
+  unset OMP_PROFILE
+  shift 3
+  exec omp "$@"
+}
+
+cmd_init() {
+  local name='' desc='' dir
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --desc) [ $# -ge 2 ] || die 2 "--desc needs a value"; desc=$2; shift 2 ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) [ -z "$name" ] || die 2 "unexpected argument: $1"; name=$1; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die 2 "usage: omph :init <name> [--desc TEXT]"
+  valid_name "$name" || die 2 "invalid profile name '$name' (allowed: A-Z a-z 0-9 _ -)"
+  umask 077
+  dir="$OMPH_PROFILES_DIR/$name"
+  [ -d "$dir" ] && echo "omph: profile '$name' exists; adding missing pieces only"
+  mkdir -p "$dir"
+  [ -e "$dir/env" ] || printf '# omph secrets for %s: exactly one KEY=VALUE (optional "export ") per line;\n# other forms are not cleared from nested omph runs.\n' "$name" >"$dir/env"
+  [ -e "$dir/mcp" ] || printf '# MCP servers for %s: names from %s, one per line\n' "$name" "$MCP_POOL" >"$dir/mcp"
+  [ -e "$dir/desc" ] || printf '%s\n' "$desc" >"$dir/desc"
+  cat <<EOF
+Profile '$name' ready in $dir
+  mcp              server names from $MCP_POOL (add servers there with omp's /mcp add)
+  env              secrets, one KEY=VALUE per line
+  instructions.md  optional, appended to the system prompt
+  skills/          optional, <skill>/SKILL.md directories
+  config.yml       optional omp settings overlay (e.g. modelRoles)
+Use in a project:  omph :use base $name
+EOF
+}
+
+cmd_use() {
+  local p target
+  [ $# -gt 0 ] || die 2 "usage: omph :use <profile> [profile...]"
+  for p in "$@"; do
+    valid_name "$p" || die 2 "invalid profile name '$p'"
+    [ -d "$OMPH_PROFILES_DIR/$p" ] || die 1 "profile '$p' not found (run: omph :init $p)"
+  done
+  target=$(git rev-parse --show-toplevel 2>/dev/null) || target=$PWD
+  case $(realpath "$target") in / | "$(realpath "$HOME")") die 2 "refusing to bind $target (would cover every unbound directory)" ;; esac
+  [ ! -L "$target/.omph" ] || die 1 "$target/.omph is a symlink; refusing"
+  [ ! -e "$target/.omph" ] || [ -f "$target/.omph" ] || die 1 "$target/.omph is not a regular file; refusing"
+  local list tmp
+  list=$(printf '%s, ' "$@")
+  list=${list%, }
+  # Write then rename: mv replaces the path itself, never a file a link points to.
+  tmp=$(mktemp "$target/.omph.XXXXXX")
+  printf '# omph: profiles for this project (see omph :which)\nprofiles = %s\n' "$list" >"$tmp"
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$target/.omph"
+  trust_marker "$target/.omph"
+  echo "omph: $target/.omph -> profiles = $list"
+}
+
+cmd_trust() {
+  local md
+  md=$(resolve_marker)
+  [ -n "$md" ] || die 1 "no .omph marker here or above"
+  parse_marker "$md/.omph"
+  trust_marker "$md/.omph"
+  echo "omph: trusted $md/.omph (profiles: $MARKER_PROFILES)"
+}
+
+cmd_which() {
+  local p dir s trusted
+  resolve_profiles
+  if [ -z "$PROFILES" ]; then
+    printf 'profiles: (none: plain omp)\ncwd: %s\n' "$PWD"
+    return 0
+  fi
+  trusted=n/a
+  case $PROFILES_SOURCE in '('*) ;; *) if is_trusted "$PROFILES_SOURCE"; then trusted=yes; else trusted='NO (run: omph :trust)'; fi ;; esac
+  printf 'profiles: %s\nsource: %s\ntrusted: %s\n' "$PROFILES" "$PROFILES_SOURCE" "$trusted"
+  for p in $PROFILES; do
+    dir="$OMPH_PROFILES_DIR/$p"
+    if [ ! -d "$dir" ]; then printf '  %s: MISSING (run: omph :init %s)\n' "$p" "$p"; continue; fi
+    s=$(list_lines "$dir/mcp" | tr '\n' ' ')
+    printf '  %s: mcp=[%s] skills=%s instructions=%s config=%s env=[%s]\n' "$p" "$(trim "$s")" \
+      "$([ -d "$dir/skills" ] && echo yes || echo no)" "$([ -s "$dir/instructions.md" ] && echo yes || echo no)" \
+      "$([ -f "$dir/config.yml" ] && echo yes || echo no)" "$([ -f "$dir/env" ] && env_keys "$dir/env")"
+  done
+}
+
+cmd_ls() {
+  local d desc found=0
+  for d in "$OMPH_PROFILES_DIR"/*/; do
+    [ -d "$d" ] || continue
+    found=1
+    desc=''
+    [ -f "$d/desc" ] && IFS= read -r desc <"$d/desc" || true
+    printf '%s  %s  mcp=[%s]\n' "$(basename "$d")" "$desc" "$(trim "$(list_lines "$d/mcp" | tr '\n' ' ')")"
+  done
+  [ $found -eq 1 ] || echo "(no profiles; run: omph :init <name>)"
+}
+
+main() {
+  case ${1-} in
+    :init) shift; cmd_init "$@" ;;
+    :use) shift; cmd_use "$@" ;;
+    :trust) shift; cmd_trust "$@" ;;
+    :which) shift; cmd_which "$@" ;;
+    :ls) shift; cmd_ls "$@" ;;
+    :*) die 2 "unknown command '$1' (valid: :init :use :trust :which :ls)" ;;
+    *)
+      command -v omp >/dev/null || die 127 "omp not found on PATH"
+      clear_inherited_scope
+      resolve_profiles
+      if [ -z "$PROFILES" ]; then exec omp "$@"; fi
+      case $PROFILES_SOURCE in '('*) ;; *) is_trusted "$PROFILES_SOURCE" || die 1 "$PROFILES_SOURCE is not trusted; review it, then run: omph :trust" ;; esac
+      activate_profiles
+      launch_omp "${PROFILES// /,}" "$_omph_keys" "${#_omph_envs[@]}" ${_omph_envs[@]+"${_omph_envs[@]}"} \
+        ${_omph_launch[@]+"${_omph_launch[@]}"} "$@"
+      ;;
+  esac
+}
+
+main "$@"

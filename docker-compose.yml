@@ -1,0 +1,8 @@
+services:
+  omph-test:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    network_mode: none
+    volumes:
+      - .:/omph:ro
